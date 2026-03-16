@@ -1,0 +1,490 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0"
+    />
+    <style>
+      :root {
+        --base: light;
+        --primary-color: #ff4b4b;
+        --background-color: transparent;
+        --secondary-background-color: #f0f2f6;
+        --text-color: #262730;
+        --font: "Source Sans Pro", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        color: var(--text-color);
+        font-family: var(--font);
+      }
+
+      .docwrap {
+        white-space: pre-wrap;
+        line-height: 1.45;
+        padding: 0.25rem 0.1rem;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      .para {
+        margin-bottom: 0.75rem;
+      }
+
+      .chunk {
+        white-space: pre-wrap;
+      }
+
+      .hl {
+        padding: 0 2px;
+        border-radius: 3px;
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        cursor: pointer;
+      }
+
+      .redact {
+        background: rgba(255, 0, 0, 0.18);
+      }
+
+      .review {
+        background: rgba(255, 191, 0, 0.22);
+      }
+
+      .keep {
+        background: rgba(0, 180, 0, 0.18);
+      }
+
+      .menu {
+        position: fixed;
+        z-index: 9999;
+        background: white;
+        color: #111;
+        border: 1px solid rgba(0, 0, 0, 0.18);
+        border-radius: 8px;
+        box-shadow: 0 6px 22px rgba(0, 0, 0, 0.18);
+        padding: 8px;
+        min-width: 180px;
+      }
+
+      .menu.hidden {
+        display: none;
+      }
+
+      .menu-title {
+        font-size: 12px;
+        color: #444;
+        margin-bottom: 6px;
+      }
+
+      .menu-actions {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+
+      .menu button {
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        background: #f7f7f7;
+        border-radius: 6px;
+        padding: 6px 10px;
+        cursor: pointer;
+        font-size: 12px;
+      }
+
+      .menu button:hover {
+        background: #efefef;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="menu" class="menu hidden"></div>
+
+    <script>
+      const root = document.getElementById("root");
+      const menu = document.getElementById("menu");
+
+      let latestArgs = { paragraphs: [], candidates: [] };
+
+      const STREAMLIT = {
+        RENDER: "streamlit:render",
+        SET_COMPONENT_VALUE: "streamlit:setComponentValue",
+        COMPONENT_READY: "streamlit:componentReady",
+        SET_FRAME_HEIGHT: "streamlit:setFrameHeight",
+      };
+
+      function sendMessageToStreamlit(type, data = {}) {
+        const payload = Object.assign(
+          {
+            isStreamlitMessage: true,
+            type,
+          },
+          data
+        );
+        window.parent.postMessage(payload, "*");
+      }
+
+      function setComponentReady() {
+        sendMessageToStreamlit(STREAMLIT.COMPONENT_READY, { apiVersion: 1 });
+      }
+
+      function setFrameHeight(height) {
+        const computedHeight =
+          height ??
+          Math.max(
+            document.documentElement.scrollHeight || 0,
+            document.body.scrollHeight || 0,
+            300
+          );
+
+        sendMessageToStreamlit(STREAMLIT.SET_FRAME_HEIGHT, {
+          height: Math.ceil(computedHeight),
+        });
+      }
+
+      function setComponentValue(value) {
+        sendMessageToStreamlit(STREAMLIT.SET_COMPONENT_VALUE, {
+          value,
+          dataType: "json",
+        });
+      }
+
+      function syncFrameHeight() {
+        requestAnimationFrame(() => setFrameHeight());
+      }
+
+      function applyTheme(theme) {
+        if (!theme) return;
+
+        const rootStyle = document.documentElement.style;
+        if (theme.base) rootStyle.setProperty("--base", theme.base);
+        if (theme.primaryColor)
+          rootStyle.setProperty("--primary-color", theme.primaryColor);
+        if (theme.backgroundColor)
+          rootStyle.setProperty("--background-color", theme.backgroundColor);
+        if (theme.secondaryBackgroundColor)
+          rootStyle.setProperty(
+            "--secondary-background-color",
+            theme.secondaryBackgroundColor
+          );
+        if (theme.textColor)
+          rootStyle.setProperty("--text-color", theme.textColor);
+        if (theme.font) rootStyle.setProperty("--font", theme.font);
+      }
+
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function hideMenu() {
+        menu.classList.add("hidden");
+        menu.innerHTML = "";
+      }
+
+      function priorityOfDecision(d) {
+        const p = { redact: 0, review: 1, keep: 2 };
+        return p[d] ?? 9;
+      }
+
+      function buildParagraphHtml(text, paraIdx, paraCandidates) {
+        const sorted = [...paraCandidates].sort((a, b) => {
+          if (a.start !== b.start) return a.start - b.start;
+          if (priorityOfDecision(a.decision) !== priorityOfDecision(b.decision)) {
+            return priorityOfDecision(a.decision) - priorityOfDecision(b.decision);
+          }
+          return (b.end - b.start) - (a.end - a.start);
+        });
+
+        const accepted = [];
+        const occupied = [];
+
+        for (const c of sorted) {
+          const overlaps = occupied.some(([s, e]) => !(c.end <= s || c.start >= e));
+          if (!overlaps) {
+            accepted.push(c);
+            occupied.push([c.start, c.end]);
+          }
+        }
+
+        accepted.sort((a, b) => a.start - b.start);
+
+        let out = "";
+        let cursor = 0;
+
+        for (const c of accepted) {
+          if (cursor < c.start) {
+            out += `<span class="chunk" data-para-idx="${paraIdx}" data-start="${cursor}" data-end="${c.start}">${escapeHtml(
+              text.slice(cursor, c.start)
+            )}</span>`;
+          }
+
+          const cls = c.decision || "review";
+          const title = `${c.detector}:${c.entity_label} | ${c.reason} | ${c.id}`;
+
+          out += `<span
+            class="chunk hl ${cls}"
+            data-candidate-id="${escapeHtml(c.id)}"
+            data-current-decision="${escapeHtml(cls)}"
+            data-para-idx="${paraIdx}"
+            data-start="${c.start}"
+            data-end="${c.end}"
+            title="${escapeHtml(title)}"
+          >${escapeHtml(text.slice(c.start, c.end))}</span>`;
+
+          cursor = c.end;
+        }
+
+        if (cursor < text.length) {
+          out += `<span class="chunk" data-para-idx="${paraIdx}" data-start="${cursor}" data-end="${text.length}">${escapeHtml(
+            text.slice(cursor)
+          )}</span>`;
+        }
+
+        if (!text.length) {
+          out += `<span class="chunk" data-para-idx="${paraIdx}" data-start="0" data-end="0">&nbsp;</span>`;
+        }
+
+        return `<div class="para" data-para-idx="${paraIdx}">${out}</div>`;
+      }
+
+      function render(args) {
+        latestArgs = args || { paragraphs: [], candidates: [] };
+
+        const paragraphs = latestArgs.paragraphs || [];
+        const candidates = latestArgs.candidates || [];
+
+        const byPara = {};
+        for (const c of candidates) {
+          const idx = Number(c.para_idx);
+          if (!byPara[idx]) byPara[idx] = [];
+          byPara[idx].push(c);
+        }
+
+        let html = `<div class="docwrap">`;
+        paragraphs.forEach((p, i) => {
+          html += buildParagraphHtml(p || "", i, byPara[i] || []);
+        });
+        html += `</div>`;
+
+        root.innerHTML = html;
+        attachHandlers();
+        syncFrameHeight();
+      }
+
+      function showMenu({ x, y, title, buttons }) {
+        menu.innerHTML = `
+          <div class="menu-title">${escapeHtml(title)}</div>
+          <div class="menu-actions">
+            ${buttons
+              .map(
+                (b, idx) =>
+                  `<button type="button" data-btn-idx="${idx}">${escapeHtml(
+                    b.label
+                  )}</button>`
+              )
+              .join("")}
+          </div>
+        `;
+
+        menu.style.left = `${Math.max(8, x)}px`;
+        menu.style.top = `${Math.max(8, y)}px`;
+        menu.classList.remove("hidden");
+
+        menu.querySelectorAll("button").forEach((btn) => {
+          btn.addEventListener("click", (e) => {
+            const idx = Number(e.currentTarget.dataset.btnIdx);
+            const action = buttons[idx];
+            if (action && typeof action.onClick === "function") {
+              action.onClick();
+            }
+            hideMenu();
+            syncFrameHeight();
+          });
+        });
+      }
+
+      function closestChunk(node) {
+        if (!node) return null;
+        if (node.nodeType === Node.ELEMENT_NODE) return node.closest(".chunk");
+        if (node.parentElement) return node.parentElement.closest(".chunk");
+        return null;
+      }
+
+      function localTextOffset(node, offset) {
+        if (node.nodeType === Node.TEXT_NODE) return offset;
+
+        let count = 0;
+        const children = node.childNodes || [];
+        for (let i = 0; i < offset; i++) {
+          count += (children[i]?.textContent || "").length;
+        }
+        return count;
+      }
+
+      function absoluteOffset(node, offset) {
+        const chunk = closestChunk(node);
+        if (!chunk) return null;
+
+        const chunkStart = Number(chunk.dataset.start || 0);
+        const chunkEnd = Number(chunk.dataset.end || chunkStart);
+        const abs = chunkStart + localTextOffset(node, offset);
+        return Math.max(chunkStart, Math.min(abs, chunkEnd));
+      }
+
+      function attachHandlers() {
+        root.querySelectorAll("[data-candidate-id]").forEach((el) => {
+          el.addEventListener("click", (evt) => {
+            evt.preventDefault();
+            evt.stopPropagation();
+
+            const id = el.dataset.candidateId;
+            const rect = el.getBoundingClientRect();
+
+            showMenu({
+              x: rect.left + window.scrollX,
+              y: rect.bottom + window.scrollY + 6,
+              title: `Span ${id}`,
+              buttons: [
+                {
+                  label: "Redact",
+                  onClick: () =>
+                    setComponentValue({
+                      type: "update_decision",
+                      id,
+                      decision: "redact",
+                      ts: Date.now(),
+                    }),
+                },
+                {
+                  label: "Review",
+                  onClick: () =>
+                    setComponentValue({
+                      type: "update_decision",
+                      id,
+                      decision: "review",
+                      ts: Date.now(),
+                    }),
+                },
+                {
+                  label: "Keep",
+                  onClick: () =>
+                    setComponentValue({
+                      type: "update_decision",
+                      id,
+                      decision: "keep",
+                      ts: Date.now(),
+                    }),
+                },
+              ],
+            });
+          });
+        });
+      }
+
+      document.addEventListener("mouseup", () => {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+
+        const range = sel.getRangeAt(0);
+        const startChunk = closestChunk(range.startContainer);
+        const endChunk = closestChunk(range.endContainer);
+
+        if (!startChunk || !endChunk) return;
+
+        const startPara = startChunk.closest(".para");
+        const endPara = endChunk.closest(".para");
+        if (!startPara || !endPara) return;
+        if (startPara.dataset.paraIdx !== endPara.dataset.paraIdx) return;
+
+        let start = absoluteOffset(range.startContainer, range.startOffset);
+        let end = absoluteOffset(range.endContainer, range.endOffset);
+        if (start == null || end == null) return;
+        if (start === end) return;
+        if (start > end) [start, end] = [end, start];
+
+        const paraIdx = Number(startPara.dataset.paraIdx);
+        const paragraphText = latestArgs.paragraphs?.[paraIdx] || "";
+        const selectedText = paragraphText.slice(start, end).trim();
+
+        if (!selectedText) return;
+
+        const rect = range.getBoundingClientRect();
+
+        showMenu({
+          x: rect.left + window.scrollX,
+          y: rect.bottom + window.scrollY + 6,
+          title: `Selected: "${
+            selectedText.length > 40 ? selectedText.slice(0, 40) + "…" : selectedText
+          }"`,
+          buttons: [
+            {
+              label: "Redact",
+              onClick: () => {
+                setComponentValue({
+                  type: "create_selection",
+                  para_idx: paraIdx,
+                  start,
+                  end,
+                  decision: "redact",
+                  ts: Date.now(),
+                });
+                sel.removeAllRanges();
+              },
+            },
+            {
+              label: "Review",
+              onClick: () => {
+                setComponentValue({
+                  type: "create_selection",
+                  para_idx: paraIdx,
+                  start,
+                  end,
+                  decision: "review",
+                  ts: Date.now(),
+                });
+                sel.removeAllRanges();
+              },
+            },
+          ],
+        });
+      });
+
+      document.addEventListener("click", (evt) => {
+        if (!menu.contains(evt.target) && !evt.target.closest("[data-candidate-id]")) {
+          hideMenu();
+        }
+      });
+
+      function onRenderMessage(event) {
+        if (!event.data || event.data.type !== STREAMLIT.RENDER) return;
+        applyTheme(event.data.theme);
+        render(event.data.args || {});
+      }
+
+      window.addEventListener("message", onRenderMessage);
+      window.addEventListener("resize", syncFrameHeight);
+
+      if ("ResizeObserver" in window) {
+        const ro = new ResizeObserver(() => syncFrameHeight());
+        ro.observe(document.body);
+      }
+
+      setComponentReady();
+      setFrameHeight(300);
+    </script>
+  </body>
+</html>

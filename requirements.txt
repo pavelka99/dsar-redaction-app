@@ -1,0 +1,6 @@
+# DSAR Redaction Tool v3.0
+pandas>=2.0
+streamlit>=1.30
+python-docx>=1.1
+transformers>=4.35
+torch>=2.1
